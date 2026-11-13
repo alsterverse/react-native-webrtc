@@ -269,20 +269,45 @@
     NSArray<AVCaptureDeviceFormat *> *formats = [RTCCameraVideoCapturer supportedFormatsForDevice:device];
     AVCaptureDeviceFormat *selectedFormat = nil;
     int currentDiff = INT_MAX;
+    Float64 currentPenalty = DBL_MAX;
 
+    // Formats of one size can differ in frame-rate range, such as 1280x720 at 1-30 and at 1-240 fps, so among
+    // equally close sizes the frame-rate range decides, the way libwebrtc's Android capturer picks one
     for (AVCaptureDeviceFormat *format in formats) {
         CMVideoDimensions dimension = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
         FourCharCode pixelFormat = CMFormatDescriptionGetMediaSubType(format.formatDescription);
         int diff = abs(targetWidth - dimension.width) + abs(targetHeight - dimension.height);
-        if (diff < currentDiff) {
+        Float64 penalty = [self frameRatePenaltyForFormat:format];
+        BOOL closer = diff < currentDiff;
+        BOOL betterFrameRate = diff == currentDiff && penalty < currentPenalty;
+        BOOL preferredPixelFormat = diff == currentDiff && penalty == currentPenalty &&
+                                    pixelFormat == [_capturer preferredOutputPixelFormat];
+        if (closer || betterFrameRate || preferredPixelFormat) {
             selectedFormat = format;
             currentDiff = diff;
-        } else if (diff == currentDiff && pixelFormat == [_capturer preferredOutputPixelFormat]) {
-            selectedFormat = format;
+            currentPenalty = penalty;
         }
     }
 
     return selectedFormat;
+}
+
+static Float64 progressivePenalty(Float64 value, Float64 threshold, Float64 lowWeight, Float64 highWeight) {
+    return value < threshold ? value * lowWeight : threshold * lowWeight + (value - threshold) * highWeight;
+}
+
+// The penalty of getClosestSupportedFramerateRange in libwebrtc's CameraEnumerationAndroid.java, in fps rather
+// than its thousandths: a top frame rate far from the requested one, and a high bottom frame rate, cost more
+// the further they go past a threshold
+- (Float64)frameRatePenaltyForFormat:(AVCaptureDeviceFormat *)format {
+    Float64 lowest = DBL_MAX;
+    for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges) {
+        Float64 minPenalty = progressivePenalty(range.minFrameRate, 8, 1, 4);
+        Float64 maxPenalty = progressivePenalty(fabs(self.frameRate - range.maxFrameRate), 5, 1, 3);
+        lowest = MIN(lowest, minPenalty + maxPenalty);
+    }
+
+    return lowest;
 }
 
 - (void)throttleFrameRateForDevice:(AVCaptureDevice *)device {
